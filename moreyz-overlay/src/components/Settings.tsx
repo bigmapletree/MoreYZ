@@ -6,14 +6,14 @@ import "./Settings.css";
 interface AppSettings {
   character_name: string;
   log_path: string;
-  custom_code: string;
+  include_history: boolean;
 }
 
 function Settings() {
   const [settings, setSettings] = useState<AppSettings>({
     character_name: "",
     log_path: "",
-    custom_code: "",
+    include_history: false,
   });
   const [saveStatus, setSaveStatus] = useState<string>("");
 
@@ -67,16 +67,6 @@ function Settings() {
     }
   };
 
-  const handleStartWatching = async () => {
-    try {
-      await invoke("start_watching");
-      setSaveStatus("✅ 开始监控日志文件");
-      setTimeout(() => setSaveStatus(""), 2000);
-    } catch (e) {
-      setSaveStatus(`❌ 监控失败: ${e}`);
-    }
-  };
-
   return (
     <div className="settings-container">
       <div className="settings-header">
@@ -88,19 +78,22 @@ function Settings() {
 
       <div className="settings-content">
         <div className="form-group">
-          <label>角色名称</label>
+          <label>角色名称 *</label>
           <input
             type="text"
             value={settings.character_name}
             onChange={(e) =>
               setSettings({ ...settings, character_name: e.target.value })
             }
-            placeholder="输入你的角色名..."
+            placeholder="输入你的角色名（必须与日志中一致）"
           />
+          <p className="hint">
+            角色名必须与战斗日志中记录的名字完全一致
+          </p>
         </div>
 
         <div className="form-group">
-          <label>日志文件路径</label>
+          <label>日志文件路径 *</label>
           <div className="path-input">
             <input
               type="text"
@@ -115,38 +108,30 @@ function Settings() {
             </button>
           </div>
           <p className="hint">
-            通常位于: World of Warcraft/_retail_/Logs/WoWCombatLog.txt
+            Windows: World of Warcraft/_retail_/Logs/WoWCombatLog.txt
             <br />
-            需要在游戏中输入 /combatlog 开启战斗日志
+            Mac: /Applications/World of Warcraft/_retail_/Logs/WoWCombatLog.txt
+            <br />
+            <strong>需要在游戏中输入 /combatlog 开启战斗日志</strong>
           </p>
         </div>
 
-        <div className="form-group">
-          <label>自定义分析代码 (Lua)</label>
-          <textarea
-            value={settings.custom_code}
-            onChange={(e) =>
-              setSettings({ ...settings, custom_code: e.target.value })
-            }
-            placeholder="-- 自定义 Lua 分析代码..."
-            rows={12}
-          />
-          <p className="hint">
-            注意: 当前版本使用 Rust 内置分析，自定义代码功能待后续版本实现
-          </p>
+        <div className="info-box">
+          <h4>使用说明</h4>
+          <ol>
+            <li>在游戏中输入 <code>/combatlog</code> 开启战斗日志记录</li>
+            <li>填写上面的角色名和日志路径</li>
+            <li>保存设置后，在主窗口点击「忽略历史」或「包含历史」初始化</li>
+            <li>之后每次脱战，新的战斗记录会自动添加到列表</li>
+          </ol>
         </div>
       </div>
 
       <div className="settings-footer">
         <span className="save-status">{saveStatus}</span>
-        <div className="footer-buttons">
-          <button className="watch-btn" onClick={handleStartWatching}>
-            开始监控
-          </button>
-          <button className="save-btn" onClick={handleSave}>
-            保存设置
-          </button>
-        </div>
+        <button className="save-btn" onClick={handleSave}>
+          保存设置
+        </button>
       </div>
     </div>
   );

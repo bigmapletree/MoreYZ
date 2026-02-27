@@ -1,15 +1,17 @@
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub character_name: String,
     pub log_path: String,
-    pub custom_code: String,
+    pub include_history: bool,
 }
 
 impl Default for AppSettings {
@@ -17,51 +19,32 @@ impl Default for AppSettings {
         Self {
             character_name: String::new(),
             log_path: String::new(),
-            custom_code: r#"-- 自定义分析代码
--- 可用变量: lines (日志行数组), character_name (角色名)
--- 返回分析结果字符串
-
-local result = {}
-local tyrant_count = 0
-local hand_count = 0
-local summons = {}
-
-for _, line in ipairs(lines) do
-    if line:match("SPELL_CAST_SUCCESS") and line:match(character_name) then
-        if line:match("265187") or line:match("Demonic Tyrant") then
-            tyrant_count = tyrant_count + 1
-        end
-        if line:match("105174") or line:match("Hand of Gul'dan") then
-            hand_count = hand_count + 1
-        end
-    end
-    if line:match("SPELL_SUMMON") and line:match(character_name) then
-        local demon = line:match("SPELL_SUMMON.-,\"([^\"]+)\"")
-        if demon then
-            summons[demon] = (summons[demon] or 0) + 1
-        end
-    end
-end
-
-table.insert(result, "=== 战斗分析 ===")
-table.insert(result, "恶魔暴君施放: " .. tyrant_count .. " 次")
-table.insert(result, "古尔丹之手施放: " .. hand_count .. " 次")
-table.insert(result, "")
-table.insert(result, "召唤恶魔统计:")
-for demon, count in pairs(summons) do
-    table.insert(result, "  " .. demon .. ": " .. count)
-end
-
-return table.concat(result, "\n")"#
-                .to_string(),
+            include_history: false,
         }
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombatRecord {
+    pub id: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub duration_seconds: i64,
+    pub encounter_name: Option<String>,
+    pub tyrant_count: i32,
+    pub hand_count: i32,
+    pub summons: std::collections::HashMap<String, i32>,
+    pub lines: Vec<String>,
+}
+
 struct AppState {
     settings: Mutex<AppSettings>,
-    analysis_result: Mutex<String>,
-    last_log_content: Mutex<String>,
+    combat_records: Mutex<Vec<CombatRecord>>,
+    last_read_position: Mutex<u64>,
+    current_combat_lines: Mutex<Vec<String>>,
+    in_combat: Mutex<bool>,
+    combat_start_time: Mutex<Option<String>>,
+    initialized: Mutex<bool>,
 }
 
 #[tauri::command]
@@ -75,15 +58,27 @@ fn save_settings(state: tauri::State<Arc<AppState>>, settings: AppSettings) {
 }
 
 #[tauri::command]
-fn get_analysis_result(state: tauri::State<Arc<AppState>>) -> String {
-    state.analysis_result.lock().unwrap().clone()
+fn get_combat_records(state: tauri::State<Arc<AppState>>) -> Vec<CombatRecord> {
+    state.combat_records.lock().unwrap().clone()
 }
 
 #[tauri::command]
-fn read_combat_log(state: tauri::State<Arc<AppState>>) -> Result<String, String> {
+fn get_combat_record_detail(state: tauri::State<Arc<AppState>>, id: String) -> Option<CombatRecord> {
+    let records = state.combat_records.lock().unwrap();
+    records.iter().find(|r| r.id == id).cloned()
+}
+
+#[tauri::command]
+fn clear_records(state: tauri::State<Arc<AppState>>) {
+    state.combat_records.lock().unwrap().clear();
+}
+
+#[tauri::command]
+fn initialize_log(state: tauri::State<Arc<AppState>>, include_history: bool) -> Result<String, String> {
     let settings = state.settings.lock().unwrap();
     let log_path = &settings.log_path;
-
+    let character_name = settings.character_name.clone();
+    
     if log_path.is_empty() {
         return Err("请先设置日志文件路径".to_string());
     }
@@ -93,34 +88,155 @@ fn read_combat_log(state: tauri::State<Arc<AppState>>) -> Result<String, String>
         return Err(format!("日志文件不存在: {}", log_path));
     }
 
-    let content = fs::read(&path).map_err(|e| format!("读取文件失败: {}", e))?;
-
-    let (decoded, _, _) = encoding_rs::UTF_8.decode(&content);
-    let content_str = decoded.to_string();
-
     drop(settings);
-    *state.last_log_content.lock().unwrap() = content_str.clone();
 
-    Ok(content_str)
+    let file = File::open(&path).map_err(|e| format!("打开文件失败: {}", e))?;
+    let file_size = file.metadata().map_err(|e| format!("获取文件信息失败: {}", e))?.len();
+
+    if include_history {
+        *state.last_read_position.lock().unwrap() = 0;
+        process_log_content(&state, &path, 0, &character_name)?;
+    } else {
+        *state.last_read_position.lock().unwrap() = file_size;
+    }
+
+    *state.initialized.lock().unwrap() = true;
+
+    let records_count = state.combat_records.lock().unwrap().len();
+    Ok(format!("初始化完成，当前 {} 条战斗记录", records_count))
 }
 
 #[tauri::command]
-fn analyze_log(state: tauri::State<Arc<AppState>>) -> Result<String, String> {
-    let settings = state.settings.lock().unwrap();
-    let log_content = state.last_log_content.lock().unwrap();
-
-    if log_content.is_empty() {
-        return Err("没有日志内容，请先读取日志".to_string());
+fn check_new_content(state: tauri::State<Arc<AppState>>) -> Result<String, String> {
+    if !*state.initialized.lock().unwrap() {
+        return Err("请先初始化".to_string());
     }
 
-    let character_name = &settings.character_name;
-    let lines: Vec<&str> = log_content.lines().collect();
+    let settings = state.settings.lock().unwrap();
+    let log_path = settings.log_path.clone();
+    let character_name = settings.character_name.clone();
+    drop(settings);
 
+    if log_path.is_empty() {
+        return Err("日志路径为空".to_string());
+    }
+
+    let path = PathBuf::from(&log_path);
+    let last_pos = *state.last_read_position.lock().unwrap();
+    
+    process_log_content(&state, &path, last_pos, &character_name)?;
+
+    let records_count = state.combat_records.lock().unwrap().len();
+    Ok(format!("检查完成，当前 {} 条战斗记录", records_count))
+}
+
+fn process_log_content(
+    state: &tauri::State<Arc<AppState>>,
+    path: &PathBuf,
+    start_pos: u64,
+    character_name: &str,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
+    let mut reader = BufReader::new(file);
+    
+    reader.seek(SeekFrom::Start(start_pos)).map_err(|e| format!("定位文件失败: {}", e))?;
+
+    let mut line = String::new();
+    let mut current_pos = start_pos;
+
+    while reader.read_line(&mut line).map_err(|e| format!("读取行失败: {}", e))? > 0 {
+        current_pos = reader.stream_position().map_err(|e| format!("获取位置失败: {}", e))?;
+        
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            process_line(state, trimmed, character_name);
+        }
+        
+        line.clear();
+    }
+
+    *state.last_read_position.lock().unwrap() = current_pos;
+    Ok(())
+}
+
+fn process_line(state: &tauri::State<Arc<AppState>>, line: &str, character_name: &str) {
+    let mut in_combat = state.in_combat.lock().unwrap();
+    let mut current_lines = state.current_combat_lines.lock().unwrap();
+    let mut combat_start = state.combat_start_time.lock().unwrap();
+
+    if line.contains("ENCOUNTER_START") || line.contains("CHALLENGE_MODE_START") {
+        *in_combat = true;
+        current_lines.clear();
+        *combat_start = extract_timestamp(line);
+        current_lines.push(line.to_string());
+    } else if line.contains("ENCOUNTER_END") || line.contains("CHALLENGE_MODE_END") {
+        current_lines.push(line.to_string());
+        
+        if *in_combat {
+            let record = create_combat_record(
+                &current_lines,
+                combat_start.clone(),
+                extract_timestamp(line),
+                extract_encounter_name(line),
+                character_name,
+            );
+            
+            let mut records = state.combat_records.lock().unwrap();
+            records.push(record);
+        }
+        
+        *in_combat = false;
+        current_lines.clear();
+        *combat_start = None;
+    } else if *in_combat {
+        current_lines.push(line.to_string());
+    } else if line.contains("SPELL_CAST_SUCCESS") && line.contains(character_name) {
+        if line.contains("265187") || line.contains("Demonic Tyrant") ||
+           line.contains("105174") || line.contains("Hand of Gul'dan") {
+            if !*in_combat {
+                *in_combat = true;
+                *combat_start = extract_timestamp(line);
+            }
+            current_lines.push(line.to_string());
+        }
+    } else if line.contains("SPELL_SUMMON") && line.contains(character_name) {
+        if !current_lines.is_empty() {
+            current_lines.push(line.to_string());
+        }
+    } else if line.contains("UNIT_DIED") && *in_combat {
+        current_lines.push(line.to_string());
+        
+        let record = create_combat_record(
+            &current_lines,
+            combat_start.clone(),
+            extract_timestamp(line),
+            None,
+            character_name,
+        );
+        
+        if record.tyrant_count > 0 || record.hand_count > 0 {
+            let mut records = state.combat_records.lock().unwrap();
+            records.push(record);
+        }
+        
+        *in_combat = false;
+        current_lines.clear();
+        *combat_start = None;
+    }
+}
+
+fn create_combat_record(
+    lines: &[String],
+    start_time: Option<String>,
+    end_time: Option<String>,
+    encounter_name: Option<String>,
+    character_name: &str,
+) -> CombatRecord {
     let mut tyrant_count = 0;
     let mut hand_count = 0;
     let mut summons: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
 
-    for line in &lines {
+    for line in lines {
         if line.contains("SPELL_CAST_SUCCESS") && line.contains(character_name) {
             if line.contains("265187") || line.contains("Demonic Tyrant") {
                 tyrant_count += 1;
@@ -136,42 +252,64 @@ fn analyze_log(state: tauri::State<Arc<AppState>>) -> Result<String, String> {
         }
     }
 
-    let mut result = Vec::new();
-    result.push("=== 战斗分析 ===".to_string());
-    result.push(format!("角色: {}", character_name));
-    result.push(format!("日志行数: {}", lines.len()));
-    result.push(String::new());
-    result.push(format!("恶魔暴君施放: {} 次", tyrant_count));
-    result.push(format!("古尔丹之手施放: {} 次", hand_count));
-    result.push(String::new());
-    result.push("召唤恶魔统计:".to_string());
+    let start = start_time.clone().unwrap_or_else(|| "unknown".to_string());
+    let end = end_time.clone().unwrap_or_else(|| "unknown".to_string());
+    
+    let duration = calculate_duration(&start, &end);
 
-    for (demon, count) in &summons {
-        result.push(format!("  {}: {}", demon, count));
+    CombatRecord {
+        id: format!("{}_{}", start.replace(['/', ':', ' ', '.'], ""), rand_suffix()),
+        start_time: start,
+        end_time: end,
+        duration_seconds: duration,
+        encounter_name,
+        tyrant_count,
+        hand_count,
+        summons,
+        lines: lines.to_vec(),
     }
+}
 
-    if summons.is_empty() {
-        result.push("  (无召唤记录)".to_string());
+fn extract_timestamp(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.split("  ").collect();
+    if !parts.is_empty() {
+        Some(parts[0].to_string())
+    } else {
+        None
     }
+}
 
-    let analysis = result.join("\n");
-
-    drop(settings);
-    drop(log_content);
-    *state.analysis_result.lock().unwrap() = analysis.clone();
-
-    Ok(analysis)
+fn extract_encounter_name(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.split(',').collect();
+    if parts.len() > 2 {
+        Some(parts[2].trim_matches('"').to_string())
+    } else {
+        None
+    }
 }
 
 fn extract_summoned_demon(line: &str) -> Option<String> {
     let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() > 17 {
-        let demon_name = parts[17].trim_matches('"').to_string();
-        if !demon_name.is_empty() {
+    if parts.len() > 9 {
+        let demon_name = parts[9].trim_matches('"').to_string();
+        if !demon_name.is_empty() && demon_name != "nil" {
             return Some(demon_name);
         }
     }
     None
+}
+
+fn calculate_duration(start: &str, end: &str) -> i64 {
+    0
+}
+
+fn rand_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("{:08x}", nanos)
 }
 
 #[tauri::command]
@@ -237,8 +375,12 @@ async fn close_settings_window(app: AppHandle) -> Result<(), String> {
 pub fn run() {
     let state = Arc::new(AppState {
         settings: Mutex::new(AppSettings::default()),
-        analysis_result: Mutex::new(String::new()),
-        last_log_content: Mutex::new(String::new()),
+        combat_records: Mutex::new(Vec::new()),
+        last_read_position: Mutex::new(0),
+        current_combat_lines: Mutex::new(Vec::new()),
+        in_combat: Mutex::new(false),
+        combat_start_time: Mutex::new(None),
+        initialized: Mutex::new(false),
     });
 
     tauri::Builder::default()
@@ -250,9 +392,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            get_analysis_result,
-            read_combat_log,
-            analyze_log,
+            get_combat_records,
+            get_combat_record_detail,
+            clear_records,
+            initialize_log,
+            check_new_content,
             start_watching,
             open_settings_window,
             close_settings_window,
