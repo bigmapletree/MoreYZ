@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -15,16 +15,8 @@ function Overlay() {
   const [analysisResult, setAnalysisResult] = useState<string>("等待分析...\n\n点击「设置」配置日志路径和角色名");
   const [isLoading, setIsLoading] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
-  const contentRef = useRef<HTMLDivElement>(null);
-  const buttonAreaRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const setupIgnoreCursor = async () => {
-      const win = getCurrentWindow();
-      await win.setIgnoreCursorEvents(true);
-    };
-    setupIgnoreCursor();
-
     const unlisten = listen("log-changed", async () => {
       await handleAnalyze();
     });
@@ -33,16 +25,6 @@ function Overlay() {
       unlisten.then((fn) => fn());
     };
   }, []);
-
-  const enableMouseEvents = async () => {
-    const win = getCurrentWindow();
-    await win.setIgnoreCursorEvents(false);
-  };
-
-  const disableMouseEvents = async () => {
-    const win = getCurrentWindow();
-    await win.setIgnoreCursorEvents(true);
-  };
 
   const handleOpenSettings = async () => {
     try {
@@ -89,25 +71,15 @@ function Overlay() {
 
   return (
     <div className="overlay-container">
-      <div
-        className="drag-area"
-        onMouseDown={handleStartDrag}
-        onMouseEnter={enableMouseEvents}
-        onMouseLeave={disableMouseEvents}
-      >
+      <div className="drag-area" onMouseDown={handleStartDrag}>
         <span className="drag-hint">⋮⋮ 拖动</span>
       </div>
 
-      <div className="content-area" ref={contentRef}>
+      <div className="content-area">
         <pre className="analysis-text">{analysisResult}</pre>
       </div>
 
-      <div
-        className="button-area"
-        ref={buttonAreaRef}
-        onMouseEnter={enableMouseEvents}
-        onMouseLeave={disableMouseEvents}
-      >
+      <div className="button-area">
         <button
           className="overlay-btn settings-btn"
           onClick={handleOpenSettings}
