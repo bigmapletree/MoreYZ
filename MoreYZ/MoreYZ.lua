@@ -1,7 +1,7 @@
 local f = CreateFrame("Frame")
 local combatLogBuffer = {}
 local MAX_PRINT_LINES = 10  -- 聊天窗口只打印前10行
--- 存储不限制，保存所有日志
+local debugEventCount = 0   -- 调试：统计事件触发次数
 
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
@@ -19,17 +19,25 @@ f:SetScript("OnEvent", function(self, event, ...)
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- 战斗开始，清空上一轮缓存
         combatLogBuffer = {}
+        debugEventCount = 0
         print("|cFFFF0000[MoreYZ DEBUG] 进入战斗，缓存已清空|r")
 
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        -- 【12.0 核心逻辑】：战斗中只存原始变量，千万不要进行任何 string 拼接或计算
-        -- 否则会触发 "attempt to perform arithmetic on a secret value" 报错
-        -- 存储所有日志，不限制数量
-        table.insert(combatLogBuffer, { CombatLogGetCurrentEventInfo() })
+        -- 调试：统计事件触发次数
+        debugEventCount = debugEventCount + 1
+        
+        -- 尝试获取数据
+        local info = { CombatLogGetCurrentEventInfo() }
+        table.insert(combatLogBuffer, info)
+        
+        -- 每10次打印一次调试信息（避免刷屏）
+        if debugEventCount <= 3 then
+            print(string.format("|cFFFF00FF[MoreYZ DEBUG] CLEU事件 #%d, info长度=%d|r", debugEventCount, #info))
+        end
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         -- 【脱战解密阶段】
-        print(string.format("|cFFFF0000[MoreYZ DEBUG] 脱战! enabled=%s, bufferSize=%d|r", tostring(MoreYZDB.enabled), #combatLogBuffer))
+        print(string.format("|cFFFF0000[MoreYZ DEBUG] 脱战! enabled=%s, bufferSize=%d, 事件触发次数=%d|r", tostring(MoreYZDB.enabled), #combatLogBuffer, debugEventCount))
         
         if MoreYZDB.enabled and #combatLogBuffer > 0 then
             local totalLines = #combatLogBuffer
