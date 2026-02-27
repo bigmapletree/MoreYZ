@@ -5,7 +5,8 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
-use chrono::{DateTime, Utc};
+
+const COMBAT_TIMEOUT_SECONDS: f64 = 8.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -29,21 +30,58 @@ pub struct CombatRecord {
     pub id: String,
     pub start_time: String,
     pub end_time: String,
-    pub duration_seconds: i64,
+    pub duration_seconds: f64,
     pub encounter_name: Option<String>,
     pub tyrant_count: i32,
     pub hand_count: i32,
     pub summons: std::collections::HashMap<String, i32>,
-    pub lines: Vec<String>,
+    pub total_events: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CombatSession {
+    lines: Vec<String>,
+    start_time: Option<f64>,
+    start_time_str: Option<String>,
+    last_event_time: Option<f64>,
+    last_event_time_str: Option<String>,
+    encounter_name: Option<String>,
+    is_encounter: bool,
+}
+
+impl CombatSession {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            start_time: None,
+            start_time_str: None,
+            last_event_time: None,
+            last_event_time_str: None,
+            encounter_name: None,
+            is_encounter: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.start_time = None;
+        self.start_time_str = None;
+        self.last_event_time = None;
+        self.last_event_time_str = None;
+        self.encounter_name = None;
+        self.is_encounter = false;
+    }
+
+    fn is_active(&self) -> bool {
+        self.start_time.is_some()
+    }
 }
 
 struct AppState {
     settings: Mutex<AppSettings>,
     combat_records: Mutex<Vec<CombatRecord>>,
     last_read_position: Mutex<u64>,
-    current_combat_lines: Mutex<Vec<String>>,
-    in_combat: Mutex<bool>,
-    combat_start_time: Mutex<Option<String>>,
+    current_session: Mutex<CombatSession>,
     initialized: Mutex<bool>,
 }
 
@@ -82,6 +120,9 @@ fn initialize_log(state: tauri::State<Arc<AppState>>, include_history: bool) -> 
     if log_path.is_empty() {
         return Err("请先设置日志文件路径".to_string());
     }
+    if character_name.is_empty() {
+        return Err("请先设置角色名称".to_string());
+    }
 
     let path = PathBuf::from(log_path);
     if !path.exists() {
@@ -89,6 +130,10 @@ fn initialize_log(state: tauri::State<Arc<AppState>>, include_history: bool) -> 
     }
 
     drop(settings);
+
+    // Clear existing records
+    state.combat_records.lock().unwrap().clear();
+    state.current_session.lock().unwrap().clear();
 
     let file = File::open(&path).map_err(|e| format!("打开文件失败: {}", e))?;
     let file_size = file.metadata().map_err(|e| format!("获取文件信息失败: {}", e))?.len();
@@ -155,93 +200,142 @@ fn process_log_content(
         line.clear();
     }
 
+    // After processing all lines, check if current session should be closed due to timeout
+    // (This handles the case where the last combat hasn't ended yet)
+    finalize_session_if_needed(state, character_name);
+
     *state.last_read_position.lock().unwrap() = current_pos;
     Ok(())
 }
 
 fn process_line(state: &tauri::State<Arc<AppState>>, line: &str, character_name: &str) {
-    let mut in_combat = state.in_combat.lock().unwrap();
-    let mut current_lines = state.current_combat_lines.lock().unwrap();
-    let mut combat_start = state.combat_start_time.lock().unwrap();
+    let timestamp = parse_timestamp(line);
+    let timestamp_str = extract_timestamp_str(line);
 
-    if line.contains("ENCOUNTER_START") || line.contains("CHALLENGE_MODE_START") {
-        *in_combat = true;
-        current_lines.clear();
-        *combat_start = extract_timestamp(line);
-        current_lines.push(line.to_string());
-    } else if line.contains("ENCOUNTER_END") || line.contains("CHALLENGE_MODE_END") {
-        current_lines.push(line.to_string());
-        
-        if *in_combat {
-            let record = create_combat_record(
-                &current_lines,
-                combat_start.clone(),
-                extract_timestamp(line),
-                extract_encounter_name(line),
-                character_name,
-            );
-            
-            let mut records = state.combat_records.lock().unwrap();
-            records.push(record);
-        }
-        
-        *in_combat = false;
-        current_lines.clear();
-        *combat_start = None;
-    } else if *in_combat {
-        current_lines.push(line.to_string());
-    } else if line.contains("SPELL_CAST_SUCCESS") && line.contains(character_name) {
-        if line.contains("265187") || line.contains("Demonic Tyrant") ||
-           line.contains("105174") || line.contains("Hand of Gul'dan") {
-            if !*in_combat {
-                *in_combat = true;
-                *combat_start = extract_timestamp(line);
+    let mut session = state.current_session.lock().unwrap();
+
+    // Handle ENCOUNTER_START
+    if line.contains("ENCOUNTER_START") {
+        // If there's an active non-encounter session, close it first
+        if session.is_active() && !session.is_encounter {
+            let record = create_combat_record(&session, character_name);
+            if record.tyrant_count > 0 || record.hand_count > 0 || record.total_events > 5 {
+                state.combat_records.lock().unwrap().push(record);
             }
-            current_lines.push(line.to_string());
-        }
-    } else if line.contains("SPELL_SUMMON") && line.contains(character_name) {
-        if !current_lines.is_empty() {
-            current_lines.push(line.to_string());
-        }
-    } else if line.contains("UNIT_DIED") && *in_combat {
-        current_lines.push(line.to_string());
-        
-        let record = create_combat_record(
-            &current_lines,
-            combat_start.clone(),
-            extract_timestamp(line),
-            None,
-            character_name,
-        );
-        
-        if record.tyrant_count > 0 || record.hand_count > 0 {
-            let mut records = state.combat_records.lock().unwrap();
-            records.push(record);
         }
         
-        *in_combat = false;
-        current_lines.clear();
-        *combat_start = None;
+        session.clear();
+        session.start_time = timestamp;
+        session.start_time_str = timestamp_str.clone();
+        session.last_event_time = timestamp;
+        session.last_event_time_str = timestamp_str;
+        session.encounter_name = extract_encounter_name(line);
+        session.is_encounter = true;
+        session.lines.push(line.to_string());
+        return;
+    }
+
+    // Handle ENCOUNTER_END
+    if line.contains("ENCOUNTER_END") {
+        session.lines.push(line.to_string());
+        session.last_event_time = timestamp;
+        session.last_event_time_str = timestamp_str;
+        
+        if session.is_active() {
+            let record = create_combat_record(&session, character_name);
+            state.combat_records.lock().unwrap().push(record);
+        }
+        
+        session.clear();
+        return;
+    }
+
+    // For non-encounter combat, check timeout
+    if session.is_active() && !session.is_encounter {
+        if let (Some(last_time), Some(current_time)) = (session.last_event_time, timestamp) {
+            if current_time - last_time > COMBAT_TIMEOUT_SECONDS {
+                // Timeout! Close the current session
+                let record = create_combat_record(&session, character_name);
+                if record.tyrant_count > 0 || record.hand_count > 0 || record.total_events > 5 {
+                    state.combat_records.lock().unwrap().push(record);
+                }
+                session.clear();
+            }
+        }
+    }
+
+    // Check if this line is a combat event for our character
+    let is_relevant = is_relevant_combat_event(line, character_name);
+
+    if is_relevant {
+        if !session.is_active() {
+            // Start a new combat session
+            session.start_time = timestamp;
+            session.start_time_str = timestamp_str.clone();
+        }
+        
+        session.last_event_time = timestamp;
+        session.last_event_time_str = timestamp_str;
+        session.lines.push(line.to_string());
+    } else if session.is_active() {
+        // Even if not directly relevant, record combat events during active session
+        if is_any_combat_event(line) {
+            session.lines.push(line.to_string());
+            session.last_event_time = timestamp;
+            session.last_event_time_str = timestamp_str;
+        }
     }
 }
 
-fn create_combat_record(
-    lines: &[String],
-    start_time: Option<String>,
-    end_time: Option<String>,
-    encounter_name: Option<String>,
-    character_name: &str,
-) -> CombatRecord {
+fn finalize_session_if_needed(state: &tauri::State<Arc<AppState>>, character_name: &str) {
+    let mut session = state.current_session.lock().unwrap();
+    
+    if session.is_active() && !session.is_encounter {
+        // For non-encounter sessions, we close them when processing ends
+        // This ensures the last combat is recorded
+        let record = create_combat_record(&session, character_name);
+        if record.tyrant_count > 0 || record.hand_count > 0 || record.total_events > 5 {
+            state.combat_records.lock().unwrap().push(record);
+        }
+        session.clear();
+    }
+}
+
+fn is_relevant_combat_event(line: &str, character_name: &str) -> bool {
+    if !line.contains(character_name) {
+        return false;
+    }
+    
+    // Combat events that indicate active combat
+    line.contains("SPELL_CAST_SUCCESS") ||
+    line.contains("SPELL_CAST_START") ||
+    line.contains("SPELL_DAMAGE") ||
+    line.contains("SPELL_PERIODIC_DAMAGE") ||
+    line.contains("SPELL_SUMMON") ||
+    line.contains("SPELL_HEAL") ||
+    line.contains("SWING_DAMAGE") ||
+    line.contains("RANGE_DAMAGE")
+}
+
+fn is_any_combat_event(line: &str) -> bool {
+    line.contains("SPELL_") ||
+    line.contains("SWING_") ||
+    line.contains("RANGE_") ||
+    line.contains("DAMAGE_") ||
+    line.contains("UNIT_DIED")
+}
+
+fn create_combat_record(session: &CombatSession, character_name: &str) -> CombatRecord {
     let mut tyrant_count = 0;
     let mut hand_count = 0;
     let mut summons: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
 
-    for line in lines {
+    for line in &session.lines {
         if line.contains("SPELL_CAST_SUCCESS") && line.contains(character_name) {
-            if line.contains("265187") || line.contains("Demonic Tyrant") {
+            if line.contains("265187") || line.contains("Demonic Tyrant") || line.contains("恶魔暴君") {
                 tyrant_count += 1;
             }
-            if line.contains("105174") || line.contains("Hand of Gul'dan") {
+            if line.contains("105174") || line.contains("Hand of Gul'dan") || line.contains("古尔丹之手") {
                 hand_count += 1;
             }
         }
@@ -252,26 +346,59 @@ fn create_combat_record(
         }
     }
 
-    let start = start_time.clone().unwrap_or_else(|| "unknown".to_string());
-    let end = end_time.clone().unwrap_or_else(|| "unknown".to_string());
+    let start_str = session.start_time_str.clone().unwrap_or_else(|| "unknown".to_string());
+    let end_str = session.last_event_time_str.clone().unwrap_or_else(|| "unknown".to_string());
     
-    let duration = calculate_duration(&start, &end);
+    let duration = match (session.start_time, session.last_event_time) {
+        (Some(start), Some(end)) => end - start,
+        _ => 0.0,
+    };
 
     CombatRecord {
-        id: format!("{}_{}", start.replace(['/', ':', ' ', '.'], ""), rand_suffix()),
-        start_time: start,
-        end_time: end,
+        id: format!("{}_{}", start_str.replace(['/', ':', ' ', '.'], ""), rand_suffix()),
+        start_time: start_str,
+        end_time: end_str,
         duration_seconds: duration,
-        encounter_name,
+        encounter_name: session.encounter_name.clone(),
         tyrant_count,
         hand_count,
         summons,
-        lines: lines.to_vec(),
+        total_events: session.lines.len(),
     }
 }
 
-fn extract_timestamp(line: &str) -> Option<String> {
-    let parts: Vec<&str> = line.split("  ").collect();
+fn parse_timestamp(line: &str) -> Option<f64> {
+    // WoW combat log format: "M/D HH:MM:SS.mmm  EVENT,..."
+    // Example: "1/15 20:30:45.123  SPELL_CAST_SUCCESS,..."
+    let parts: Vec<&str> = line.splitn(2, "  ").collect();
+    if parts.is_empty() {
+        return None;
+    }
+    
+    let time_part = parts[0];
+    // Parse "M/D HH:MM:SS.mmm"
+    let time_parts: Vec<&str> = time_part.split(' ').collect();
+    if time_parts.len() < 2 {
+        return None;
+    }
+    
+    let clock_part = time_parts.last()?;
+    let clock_parts: Vec<&str> = clock_part.split(':').collect();
+    if clock_parts.len() < 3 {
+        return None;
+    }
+    
+    let hours: f64 = clock_parts[0].parse().ok()?;
+    let minutes: f64 = clock_parts[1].parse().ok()?;
+    let seconds: f64 = clock_parts[2].parse().ok()?;
+    
+    // Convert to seconds since midnight for comparison
+    // Note: This doesn't handle day boundaries, but should work for most cases
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn extract_timestamp_str(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.splitn(2, "  ").collect();
     if !parts.is_empty() {
         Some(parts[0].to_string())
     } else {
@@ -280,6 +407,7 @@ fn extract_timestamp(line: &str) -> Option<String> {
 }
 
 fn extract_encounter_name(line: &str) -> Option<String> {
+    // ENCOUNTER_START format: timestamp  ENCOUNTER_START,encounterID,"encounterName",difficultyID,...
     let parts: Vec<&str> = line.split(',').collect();
     if parts.len() > 2 {
         Some(parts[2].trim_matches('"').to_string())
@@ -289,18 +417,16 @@ fn extract_encounter_name(line: &str) -> Option<String> {
 }
 
 fn extract_summoned_demon(line: &str) -> Option<String> {
+    // SPELL_SUMMON format: ...,destGUID,destName,destFlags,...
+    // destName is typically at position 9 (0-indexed)
     let parts: Vec<&str> = line.split(',').collect();
     if parts.len() > 9 {
         let demon_name = parts[9].trim_matches('"').to_string();
-        if !demon_name.is_empty() && demon_name != "nil" {
+        if !demon_name.is_empty() && demon_name != "nil" && demon_name != "0x0000000000000000" {
             return Some(demon_name);
         }
     }
     None
-}
-
-fn calculate_duration(start: &str, end: &str) -> i64 {
-    0
 }
 
 fn rand_suffix() -> String {
@@ -377,9 +503,7 @@ pub fn run() {
         settings: Mutex::new(AppSettings::default()),
         combat_records: Mutex::new(Vec::new()),
         last_read_position: Mutex::new(0),
-        current_combat_lines: Mutex::new(Vec::new()),
-        in_combat: Mutex::new(false),
-        combat_start_time: Mutex::new(None),
+        current_session: Mutex::new(CombatSession::new()),
         initialized: Mutex::new(false),
     });
 
