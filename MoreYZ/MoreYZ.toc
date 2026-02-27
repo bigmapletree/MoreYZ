@@ -1,7 +1,0 @@
-## Interface: 120001
-## Title: MoreYZ
-## Notes: 监控战斗数据并在脱战后处理
-## SavedVariables: MoreYZDB
-## Author: YourName
-
-MoreYZ.lua
