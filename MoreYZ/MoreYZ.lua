@@ -3,12 +3,6 @@ local combatLogBuffer = {}
 local MAX_PRINT_LINES = 10  -- 聊天窗口只打印前10行
 -- 存储不限制，保存所有日志
 
--- 12.0 特色：检查某个值是否为加密状态（用于调试）
-local function IsSecret(val)
-    if issecretvalue then return issecretvalue(val) end
-    return false
-end
-
 f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 f:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -25,6 +19,7 @@ f:SetScript("OnEvent", function(self, event, ...)
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- 战斗开始，清空上一轮缓存
         combatLogBuffer = {}
+        print("|cFFFF0000[MoreYZ DEBUG] 进入战斗，缓存已清空|r")
 
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
         -- 【12.0 核心逻辑】：战斗中只存原始变量，千万不要进行任何 string 拼接或计算
@@ -33,7 +28,9 @@ f:SetScript("OnEvent", function(self, event, ...)
         table.insert(combatLogBuffer, { CombatLogGetCurrentEventInfo() })
 
     elseif event == "PLAYER_REGEN_ENABLED" then
-        -- 【脱战解密阶段】：此时数据盒子已经自动解锁
+        -- 【脱战解密阶段】
+        print(string.format("|cFFFF0000[MoreYZ DEBUG] 脱战! enabled=%s, bufferSize=%d|r", tostring(MoreYZDB.enabled), #combatLogBuffer))
+        
         if MoreYZDB.enabled and #combatLogBuffer > 0 then
             local totalLines = #combatLogBuffer
             print(string.format("|cFFFFFF00[MoreYZ] 战斗已结束，共 %d 条日志，打印前 %d 条：|r", totalLines, MAX_PRINT_LINES))
