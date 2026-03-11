@@ -41,3 +41,8 @@
 | `/myz test`     | 模拟测试各档评价                   |
 | `/myz history`  | 查看最近 10 次暴君记录             |
 | `/myz clear`    | 清空历史记录                       |
+
+## 许可证
+
+[MIT License](LICENSE)
+
