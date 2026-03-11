@@ -46,6 +46,7 @@ local combatHistory    = {}       -- 当前战斗内的记录（临时）
 local pendingReports   = {}       -- 脱战后待发消息
 local burstTimer       = nil
 local inCombat         = false
+local inBossEncounter  = false    -- 是否处于Boss战斗中（ENCOUNTER_START/END）
 
 -- =============================================================
 -- 工具函数
@@ -124,7 +125,7 @@ local function FinalizeBurst()
     local msg = BuildReportMessage(burstIndex, handCount, demons)
     LocalPrint(msg)
 
-    if db.reportAfterCombat then
+    if db.reportAfterCombat or inBossEncounter then
         table.insert(pendingReports, msg)
     else
         SendPartyMessage(msg)
@@ -205,6 +206,8 @@ eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+eventFrame:RegisterEvent("ENCOUNTER_START")
+eventFrame:RegisterEvent("ENCOUNTER_END")
 
 eventFrame:SetScript("OnEvent", function(_, event, ...)
     if event == "PLAYER_LOGIN" then
@@ -227,7 +230,15 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         inCombat = false
+        inBossEncounter = false   -- 脱战时确保重置
         OnCombatEnd()
+
+    elseif event == "ENCOUNTER_START" then
+        inBossEncounter = true
+        LocalPrint("检测到Boss战斗，通报将延迟到脱战后发送")
+
+    elseif event == "ENCOUNTER_END" then
+        inBossEncounter = false
     end
 end)
 
