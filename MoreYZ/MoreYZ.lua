@@ -231,13 +231,15 @@ local function OnCombatEnd()
         tostring(isBossEnd), tostring(isTyrantActive), #combatHistory, #pendingReports))
 
     -- Boss 脱战：提前结算活跃爆发
-    -- 注意：此时 inCombat 仍为 true，FinalizeBurst 会正确入队
+    -- 注意：此时 inCombat 仍为 true，需要临时恢复 inBossEncounter 让 FinalizeBurst 正确入队
     if isTyrantActive and isBossEnd then
         if burstTimer then
             burstTimer:Cancel()
             burstTimer = nil
         end
+        inBossEncounter = true   -- 临时恢复，让 FinalizeBurst 走入队路径
         FinalizeBurst()
+        inBossEncounter = false
     end
 
     -- 本地打印战斗汇总
@@ -390,7 +392,5 @@ SlashCmdList["MOREYZ"] = function(input)
         Print("  /myz test     - 模拟测试各档评价")
         Print("  /myz history  - 查看最近10次暴君记录")
         Print("  /myz clear    - 清空历史记录")
-        Print("  /myz debug    - 开关调试输出")
-        Print("  /myz status   - 查看当前状态")
     end
 end
