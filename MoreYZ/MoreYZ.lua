@@ -125,7 +125,7 @@ local function FinalizeBurst()
     local msg = BuildReportMessage(burstIndex, handCount, demons)
     LocalPrint(msg)
 
-    if db.reportAfterCombat or inBossEncounter then
+    if db.reportAfterCombat or (inCombat and inBossEncounter) then
         table.insert(pendingReports, msg)
     else
         SendPartyMessage(msg)
@@ -159,18 +159,23 @@ local function RecordHand()
     handCount = handCount + 1
 end
 
---- 脱战后发送队列
+--- 脱战后发送队列（间隔0.5s逐条发送，确保正序显示）
 local function FlushPendingReports()
     if #pendingReports == 0 then return end
-    for _, msg in ipairs(pendingReports) do
-        SendPartyMessage(msg)
-    end
+    local reports = { unpack(pendingReports) }
     wipe(pendingReports)
+    for i, msg in ipairs(reports) do
+        C_Timer.After((i - 1) * 0.5, function()
+            SendPartyMessage(msg)
+        end)
+    end
 end
 
 --- 战斗结束清理
-local function OnCombatEnd()
-    if isTyrantActive then
+local function OnCombatEnd(isBossEnd)
+    -- Boss 脱战：提前结算活跃爆发（Boss 打完不会马上再进战）
+    -- 小怪脱战：不提前结算，让 25s 计时器自然到期
+    if isTyrantActive and isBossEnd then
         if burstTimer then
             burstTimer:Cancel()
             burstTimer = nil
@@ -190,11 +195,14 @@ local function OnCombatEnd()
         LocalPrint("------------------------")
     end
 
+    -- 先发送已完成爆发的待发报告
     FlushPendingReports()
 
-    burstIndex = 0
-    wipe(combatHistory)
-    wipe(pendingReports)
+    -- 如果没有活跃爆发，清理所有状态
+    if not isTyrantActive then
+        burstIndex = 0
+        wipe(combatHistory)
+    end
 end
 
 -- =============================================================
@@ -230,8 +238,9 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         inCombat = false
+        local wasBoss = inBossEncounter
         inBossEncounter = false   -- 脱战时确保重置
-        OnCombatEnd()
+        OnCombatEnd(wasBoss)
 
     elseif event == "ENCOUNTER_START" then
         inBossEncounter = true
