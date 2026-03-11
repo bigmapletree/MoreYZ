@@ -48,12 +48,19 @@ local burstTimer       = nil
 local inCombat         = false
 local inBossEncounter  = false    -- 当前是否在Boss战斗中（ENCOUNTER_START/END实时状态）
 local hadBossEncounter = false    -- 本次战斗是否经历过Boss（用于脱战时判断，消费后重置）
+local debugMode        = false    -- Debug 模式
 
 -- =============================================================
 -- 工具函数
 -- =============================================================
 local function Print(msg)
     print("|cff8788EE[MoreYZ]|r " .. msg)
+end
+
+local function DebugPrint(msg)
+    if debugMode then
+        print("|cffFFFF00[MoreYZ-DBG]|r " .. msg)
+    end
 end
 
 --- 评价文案（根据恶魔数量，6档）
@@ -82,13 +89,21 @@ end
 
 --- 发送队伍消息（自动选择频道：副本队伍优先，否则小队）
 local function SendPartyMessage(msg)
-    if not db.reportToParty then return end
-    if not IsInGroup() then return end
+    if not db.reportToParty then
+        DebugPrint("SendPartyMessage: reportToParty=false, 跳过")
+        return
+    end
+    if not IsInGroup() then
+        DebugPrint("SendPartyMessage: 不在队伍中, 跳过")
+        return
+    end
 
     -- 副本队伍（随机副本/随机团等）优先使用 INSTANCE_CHAT
     if db.reportToInstance and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+        DebugPrint("SendPartyMessage: 发送到 INSTANCE_CHAT")
         SendChatMessage(msg, "INSTANCE_CHAT")
     else
+        DebugPrint("SendPartyMessage: 发送到 PARTY")
         SendChatMessage(msg, "PARTY")
     end
 end
@@ -105,10 +120,12 @@ end
 -- =============================================================
 
 --- 结束当前爆发窗口
-local function FinalizeBurst()
+--- @param overrideIndex number|nil  强制使用的爆发序号（计时器延迟触发时传入）
+local function FinalizeBurst(overrideIndex)
     if not isTyrantActive then return end
     isTyrantActive = false
 
+    local reportIndex = overrideIndex or burstIndex
     local demons = math.floor(handCount / HANDS_PER_DEMON)
     local record = {
         hands  = handCount,
@@ -122,15 +139,18 @@ local function FinalizeBurst()
         table.remove(db.history, 1)
     end
 
-    local msg = BuildReportMessage(burstIndex, handCount, demons)
+    local msg = BuildReportMessage(reportIndex, handCount, demons)
     LocalPrint(msg)
+
+    DebugPrint(string.format("FinalizeBurst: reportIndex=%d, inCombat=%s, reportAfterCombat=%s, inBossEncounter=%s, pendingReports=%d",
+        reportIndex, tostring(inCombat), tostring(db.reportAfterCombat), tostring(inBossEncounter), #pendingReports))
 
     if inCombat then
         -- 战斗中结算：记录到本场战斗历史
         table.insert(combatHistory, record)
         -- 判断是否需要延迟通报
         if db.reportAfterCombat or inBossEncounter then
-            table.insert(pendingReports, { index = burstIndex, hands = handCount, demons = demons })
+            table.insert(pendingReports, { index = reportIndex, hands = handCount, demons = demons })
         else
             SendPartyMessage(msg)
         end
@@ -146,7 +166,7 @@ end
 --- 开始新一轮爆发窗口
 local function StartBurst()
     if isTyrantActive then
-        FinalizeBurst()
+        FinalizeBurst(burstIndex)
     end
 
     burstIndex = burstIndex + 1
@@ -156,8 +176,12 @@ local function StartBurst()
 
     LocalPrint(string.format("第%d次暴君爆发开始！（%ds 监控窗口）", burstIndex, BURST_WINDOW))
 
+    -- 保存当前 burstIndex 副本，防止计时器触发时 burstIndex 已被重置
+    local savedBurstIndex = burstIndex
     burstTimer = C_Timer.After(BURST_WINDOW, function()
-        FinalizeBurst()
+        DebugPrint(string.format("计时器触发: savedIndex=%d, 当前 burstIndex=%d, inCombat=%s",
+            savedBurstIndex, burstIndex, tostring(inCombat)))
+        FinalizeBurst(savedBurstIndex)
     end)
 end
 
@@ -169,6 +193,7 @@ end
 
 --- 脱战后发送队列（合并成一条汇总消息）
 local function FlushPendingReports()
+    DebugPrint(string.format("FlushPendingReports: pendingReports=%d", #pendingReports))
     if #pendingReports == 0 then return end
 
     local parts = {}
@@ -195,6 +220,8 @@ end
 --- 战斗结束清理
 local function OnCombatEnd()
     local isBossEnd = hadBossEncounter
+    DebugPrint(string.format("OnCombatEnd: isBossEnd=%s, isTyrantActive=%s, combatHistory=%d, pendingReports=%d",
+        tostring(isBossEnd), tostring(isTyrantActive), #combatHistory, #pendingReports))
 
     -- Boss 脱战：提前结算活跃爆发
     -- 注意：此时 inCombat 仍为 true，FinalizeBurst 会正确入队
@@ -258,22 +285,28 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
 
     elseif event == "PLAYER_REGEN_DISABLED" then
         inCombat = true
+        DebugPrint("事件: PLAYER_REGEN_DISABLED (进战)")
 
     elseif event == "PLAYER_REGEN_ENABLED" then
+        DebugPrint(string.format("事件: PLAYER_REGEN_ENABLED (脱战) burstIndex=%d, isTyrantActive=%s",
+            burstIndex, tostring(isTyrantActive)))
         -- 先处理战斗结束（此时 inCombat 仍为 true）
         OnCombatEnd()
         -- 再重置状态
         inCombat = false
         inBossEncounter = false
         hadBossEncounter = false
+        DebugPrint(string.format("脱战重置完成: burstIndex=%d, inCombat=%s", burstIndex, tostring(inCombat)))
 
     elseif event == "ENCOUNTER_START" then
         inBossEncounter = true
         hadBossEncounter = true
+        DebugPrint("事件: ENCOUNTER_START")
         LocalPrint("检测到Boss战斗，通报将延迟到脱战后发送")
 
     elseif event == "ENCOUNTER_END" then
         inBossEncounter = false
+        DebugPrint("事件: ENCOUNTER_END (hadBossEncounter保留)")
         -- hadBossEncounter 保留，留到 OnCombatEnd 消费
     end
 end)
@@ -321,6 +354,22 @@ SlashCmdList["MOREYZ"] = function(input)
             Print("------------------------")
         end
 
+    elseif arg == "debug" then
+        debugMode = not debugMode
+        Print("Debug模式: " .. (debugMode and "|cff00ff00开启|r" or "|cffff0000关闭|r"))
+
+    elseif arg == "status" then
+        Print("=== 当前状态 ===")
+        Print(string.format("  inCombat=%s, inBossEncounter=%s, hadBossEncounter=%s",
+            tostring(inCombat), tostring(inBossEncounter), tostring(hadBossEncounter)))
+        Print(string.format("  isTyrantActive=%s, burstIndex=%d, handCount=%d",
+            tostring(isTyrantActive), burstIndex, handCount))
+        Print(string.format("  combatHistory=%d, pendingReports=%d", #combatHistory, #pendingReports))
+        Print(string.format("  reportToParty=%s, reportAfterCombat=%s, reportToInstance=%s",
+            tostring(db.reportToParty), tostring(db.reportAfterCombat), tostring(db.reportToInstance)))
+        Print(string.format("  IsInGroup=%s, IsInGroup(INSTANCE)=%s",
+            tostring(IsInGroup()), tostring(IsInGroup(LE_PARTY_CATEGORY_INSTANCE))))
+
     elseif arg == "clear" then
         if db.history then wipe(db.history) end
         Print("历史记录已清空")
@@ -334,5 +383,7 @@ SlashCmdList["MOREYZ"] = function(input)
         Print("  /myz test     - 模拟测试各档评价")
         Print("  /myz history  - 查看最近10次暴君记录")
         Print("  /myz clear    - 清空历史记录")
+        Print("  /myz debug    - 开关调试输出")
+        Print("  /myz status   - 查看当前状态")
     end
 end
