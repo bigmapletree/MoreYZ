@@ -126,7 +126,8 @@ local function FinalizeBurst()
     LocalPrint(msg)
 
     if db.reportAfterCombat or (inCombat and inBossEncounter) then
-        table.insert(pendingReports, msg)
+        -- 存结构化数据，脱战后合并成一条消息发送
+        table.insert(pendingReports, { index = burstIndex, hands = handCount, demons = demons })
     else
         SendPartyMessage(msg)
     end
@@ -159,16 +160,29 @@ local function RecordHand()
     handCount = handCount + 1
 end
 
---- 脱战后发送队列（间隔0.5s逐条发送，确保正序显示）
+--- 脱战后发送队列（合并成一条汇总消息）
 local function FlushPendingReports()
     if #pendingReports == 0 then return end
-    local reports = { unpack(pendingReports) }
-    wipe(pendingReports)
-    for i, msg in ipairs(reports) do
-        C_Timer.After((i - 1) * 0.5, function()
-            SendPartyMessage(msg)
-        end)
+
+    local parts = {}
+    local totalDemons = 0
+    for _, rec in ipairs(pendingReports) do
+        local eval = GetEvaluation(rec.demons)
+        table.insert(parts, string.format("第%d次:%d手→%d魔(%s)", rec.index, rec.hands, rec.demons, eval))
+        totalDemons = totalDemons + rec.demons
     end
+
+    local summary
+    if #pendingReports == 1 then
+        local r = pendingReports[1]
+        summary = BuildReportMessage(r.index, r.hands, r.demons)
+    else
+        summary = string.format("暴君汇总(%d次,共%d恶魔): %s",
+            #pendingReports, totalDemons, table.concat(parts, " | "))
+    end
+
+    SendPartyMessage(summary)
+    wipe(pendingReports)
 end
 
 --- 战斗结束清理
