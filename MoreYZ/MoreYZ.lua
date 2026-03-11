@@ -191,7 +191,7 @@ local function RecordHand()
     handCount = handCount + 1
 end
 
---- 脱战后发送队列（合并成一条汇总消息）
+--- 脱战后发送队列（合并成一条汇总消息，延迟到下一帧发送）
 local function FlushPendingReports()
     DebugPrint(string.format("FlushPendingReports: pendingReports=%d", #pendingReports))
     if #pendingReports == 0 then return end
@@ -209,12 +209,19 @@ local function FlushPendingReports()
         local r = pendingReports[1]
         summary = BuildReportMessage(r.index, r.hands, r.demons)
     else
+        -- 注意：WoW 聊天中 | 是转义前缀，不能直接用作分隔符
         summary = string.format("暴君汇总(%d次,共%d恶魔): %s",
-            #pendingReports, totalDemons, table.concat(parts, " | "))
+            #pendingReports, totalDemons, table.concat(parts, " / "))
     end
 
-    SendPartyMessage(summary)
+    -- 先清空队列，确保不会因为发送失败而卡住
     wipe(pendingReports)
+
+    -- 延迟一帧发送，确保脱战处理完毕
+    C_Timer.After(0, function()
+        DebugPrint("FlushPendingReports: 延迟发送触发")
+        SendPartyMessage(summary)
+    end)
 end
 
 --- 战斗结束清理
