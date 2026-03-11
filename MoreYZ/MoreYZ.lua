@@ -21,9 +21,10 @@ _G.MoreYZDB = _G.MoreYZDB or {}
 local db
 
 local DB_DEFAULTS = {
-    reportToParty     = true,   -- 是否通报小队
+    reportToParty     = true,   -- 是否通报队伍
     reportAfterCombat = false,  -- true=脱战后汇总通报, false=每次爆发结束立即通报
     showLocalPrint    = true,   -- 本地聊天框输出
+    reportToInstance  = true,   -- 副本队伍时使用副本频道通报（优先于小队频道）
 }
 
 local function InitDB()
@@ -36,11 +37,12 @@ end
 -- =============================================================
 -- 运行时状态
 -- =============================================================
+local MAX_HISTORY       = 10      -- 最多保留最近10条记录
 local isTyrantActive   = false
 local tyrantStartTime  = 0
 local handCount        = 0
 local burstIndex       = 0
-local burstHistory     = {}       -- { {hands=N, demons=M}, ... }
+local combatHistory    = {}       -- 当前战斗内的记录（临时）
 local pendingReports   = {}       -- 脱战后待发消息
 local burstTimer       = nil
 local inCombat         = false
@@ -76,10 +78,15 @@ local function BuildReportMessage(index, hands, demons)
         index, hands, demons, eval)
 end
 
---- 发送小队消息
+--- 发送队伍消息（自动选择频道：副本队伍优先，否则小队）
 local function SendPartyMessage(msg)
     if not db.reportToParty then return end
-    if IsInGroup() then
+    if not IsInGroup() then return end
+
+    -- 副本队伍（随机副本/随机团等）优先使用 INSTANCE_CHAT
+    if db.reportToInstance and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+        SendChatMessage(msg, "INSTANCE_CHAT")
+    else
         SendChatMessage(msg, "PARTY")
     end
 end
@@ -101,7 +108,18 @@ local function FinalizeBurst()
     isTyrantActive = false
 
     local demons = math.floor(handCount / HANDS_PER_DEMON)
-    table.insert(burstHistory, { hands = handCount, demons = demons })
+    local record = {
+        hands  = handCount,
+        demons = demons,
+        time   = date("%m/%d %H:%M"),
+    }
+    table.insert(combatHistory, record)
+
+    -- 持久化到 db.history，保留最近 MAX_HISTORY 条
+    table.insert(db.history, record)
+    while #db.history > MAX_HISTORY do
+        table.remove(db.history, 1)
+    end
 
     local msg = BuildReportMessage(burstIndex, handCount, demons)
     LocalPrint(msg)
@@ -159,22 +177,22 @@ local function OnCombatEnd()
         FinalizeBurst()
     end
 
-    if #burstHistory > 0 then
+    if #combatHistory > 0 then
         LocalPrint("--- 本场战斗暴君汇总 ---")
         local totalDemons = 0
-        for i, rec in ipairs(burstHistory) do
+        for i, rec in ipairs(combatHistory) do
             local eval = GetEvaluation(rec.demons)
             LocalPrint(string.format("  第%d次: %d手 → %d恶魔 %s", i, rec.hands, rec.demons, eval))
             totalDemons = totalDemons + rec.demons
         end
-        LocalPrint(string.format("  合计: %d次暴君，%d个恶魔", #burstHistory, totalDemons))
+        LocalPrint(string.format("  合计: %d次暴君，%d个恶魔", #combatHistory, totalDemons))
         LocalPrint("------------------------")
     end
 
     FlushPendingReports()
 
     burstIndex = 0
-    wipe(burstHistory)
+    wipe(combatHistory)
     wipe(pendingReports)
 end
 
@@ -191,6 +209,7 @@ eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventFrame:SetScript("OnEvent", function(_, event, ...)
     if event == "PLAYER_LOGIN" then
         InitDB()
+        if not db.history then db.history = {} end
         Print("已加载 - /myz 查看帮助")
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
@@ -228,6 +247,10 @@ SlashCmdList["MOREYZ"] = function(input)
         db.reportAfterCombat = not db.reportAfterCombat
         Print("脱战后通报: " .. (db.reportAfterCombat and "|cff00ff00开启|r（攒到脱战后发）" or "|cffff0000关闭|r（每次爆发结束立即发）"))
 
+    elseif arg == "instance" then
+        db.reportToInstance = not db.reportToInstance
+        Print("副本频道通报: " .. (db.reportToInstance and "|cff00ff00开启|r（副本队伍时用副本频道）" or "|cffff0000关闭|r（始终用小队频道）"))
+
     elseif arg == "local" then
         db.showLocalPrint = not db.showLocalPrint
         Print("本地输出: " .. (db.showLocalPrint and "|cff00ff00开启|r" or "|cffff0000关闭|r"))
@@ -239,20 +262,30 @@ SlashCmdList["MOREYZ"] = function(input)
         end
 
     elseif arg == "history" then
-        if #burstHistory == 0 then
-            Print("本场战斗暂无暴君记录")
+        if not db.history or #db.history == 0 then
+            Print("暂无暴君记录")
         else
-            for i, rec in ipairs(burstHistory) do
-                Print(BuildReportMessage(i, rec.hands, rec.demons))
+            Print(string.format("--- 最近%d次暴君记录 ---", #db.history))
+            for i, rec in ipairs(db.history) do
+                local eval = GetEvaluation(rec.demons)
+                local timeStr = rec.time or "未知时间"
+                Print(string.format("  #%d [%s] %d手 → %d恶魔 %s", i, timeStr, rec.hands, rec.demons, eval))
             end
+            Print("------------------------")
         end
+
+    elseif arg == "clear" then
+        if db.history then wipe(db.history) end
+        Print("历史记录已清空")
 
     else
         Print("命令列表:")
-        Print("  /myz party   - 开关小队通报")
-        Print("  /myz delay   - 切换立即/脱战后通报")
-        Print("  /myz local   - 开关本地聊天框输出")
-        Print("  /myz test    - 模拟测试各档评价")
-        Print("  /myz history - 查看本场战斗暴君记录")
+        Print("  /myz party    - 开关队伍通报")
+        Print("  /myz instance - 开关副本频道通报（随机副本时优先）")
+        Print("  /myz delay    - 切换立即/脱战后通报")
+        Print("  /myz local    - 开关本地聊天框输出")
+        Print("  /myz test     - 模拟测试各档评价")
+        Print("  /myz history  - 查看最近10次暴君记录")
+        Print("  /myz clear    - 清空历史记录")
     end
 end
