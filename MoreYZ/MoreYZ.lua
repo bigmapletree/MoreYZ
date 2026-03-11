@@ -46,7 +46,8 @@ local combatHistory    = {}       -- 当前战斗内的记录（临时）
 local pendingReports   = {}       -- 脱战后待发消息
 local burstTimer       = nil
 local inCombat         = false
-local inBossEncounter  = false    -- 是否处于Boss战斗中（ENCOUNTER_START/END）
+local inBossEncounter  = false    -- 当前是否在Boss战斗中（ENCOUNTER_START/END实时状态）
+local hadBossEncounter = false    -- 本次战斗是否经历过Boss（用于脱战时判断，消费后重置）
 
 -- =============================================================
 -- 工具函数
@@ -114,7 +115,6 @@ local function FinalizeBurst()
         demons = demons,
         time   = date("%m/%d %H:%M"),
     }
-    table.insert(combatHistory, record)
 
     -- 持久化到 db.history，保留最近 MAX_HISTORY 条
     table.insert(db.history, record)
@@ -125,16 +125,17 @@ local function FinalizeBurst()
     local msg = BuildReportMessage(burstIndex, handCount, demons)
     LocalPrint(msg)
 
-    -- 判断是否需要延迟通报：
-    -- 1) 用户开启了脱战通报 且 当前在战斗中
-    -- 2) 或者 Boss 战斗中（自动延迟）
-    -- 如果已经脱战了（计时器延迟触发），直接发送不入队
-    local shouldDelay = inCombat and (db.reportAfterCombat or inBossEncounter)
-
-    if shouldDelay then
-        -- 存结构化数据，脱战后合并成一条消息发送
-        table.insert(pendingReports, { index = burstIndex, hands = handCount, demons = demons })
+    if inCombat then
+        -- 战斗中结算：记录到本场战斗历史
+        table.insert(combatHistory, record)
+        -- 判断是否需要延迟通报
+        if db.reportAfterCombat or inBossEncounter then
+            table.insert(pendingReports, { index = burstIndex, hands = handCount, demons = demons })
+        else
+            SendPartyMessage(msg)
+        end
     else
+        -- 脱战后计时器到期：直接发送，不再纳入战斗汇总
         SendPartyMessage(msg)
     end
 
@@ -192,9 +193,11 @@ local function FlushPendingReports()
 end
 
 --- 战斗结束清理
-local function OnCombatEnd(isBossEnd)
-    -- Boss 脱战：提前结算活跃爆发（Boss 打完不会马上再进战）
-    -- 小怪脱战：不提前结算，让 25s 计时器自然到期
+local function OnCombatEnd()
+    local isBossEnd = hadBossEncounter
+
+    -- Boss 脱战：提前结算活跃爆发
+    -- 注意：此时 inCombat 仍为 true，FinalizeBurst 会正确入队
     if isTyrantActive and isBossEnd then
         if burstTimer then
             burstTimer:Cancel()
@@ -203,6 +206,7 @@ local function OnCombatEnd(isBossEnd)
         FinalizeBurst()
     end
 
+    -- 本地打印战斗汇总
     if #combatHistory > 0 then
         LocalPrint("--- 本场战斗暴君汇总 ---")
         local totalDemons = 0
@@ -215,14 +219,13 @@ local function OnCombatEnd(isBossEnd)
         LocalPrint("------------------------")
     end
 
-    -- 先发送已完成爆发的待发报告
+    -- 发送待发报告
     FlushPendingReports()
 
-    -- 如果没有活跃爆发，清理所有状态
-    if not isTyrantActive then
-        burstIndex = 0
-        wipe(combatHistory)
-    end
+    -- 始终清理本场战斗数据（活跃爆发的计时器会自行处理）
+    burstIndex = 0
+    wipe(combatHistory)
+    wipe(pendingReports)
 end
 
 -- =============================================================
@@ -257,17 +260,21 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         inCombat = true
 
     elseif event == "PLAYER_REGEN_ENABLED" then
+        -- 先处理战斗结束（此时 inCombat 仍为 true）
+        OnCombatEnd()
+        -- 再重置状态
         inCombat = false
-        local wasBoss = inBossEncounter
-        inBossEncounter = false   -- 脱战时确保重置
-        OnCombatEnd(wasBoss)
+        inBossEncounter = false
+        hadBossEncounter = false
 
     elseif event == "ENCOUNTER_START" then
         inBossEncounter = true
+        hadBossEncounter = true
         LocalPrint("检测到Boss战斗，通报将延迟到脱战后发送")
 
     elseif event == "ENCOUNTER_END" then
         inBossEncounter = false
+        -- hadBossEncounter 保留，留到 OnCombatEnd 消费
     end
 end)
 
