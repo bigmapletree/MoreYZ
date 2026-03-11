@@ -2,7 +2,7 @@
 ## Title: MoreYZ
 ## Notes: 恶魔学识术士暴君爆发监控
 ## Author: MoreYZ
-## Version: 1.0.0
+## Version: 1.0.1
 ## DefaultState: Enabled
 ## SavedVariables: MoreYZDB
 
