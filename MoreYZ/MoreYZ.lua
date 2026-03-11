@@ -125,7 +125,13 @@ local function FinalizeBurst()
     local msg = BuildReportMessage(burstIndex, handCount, demons)
     LocalPrint(msg)
 
-    if db.reportAfterCombat or (inCombat and inBossEncounter) then
+    -- 判断是否需要延迟通报：
+    -- 1) 用户开启了脱战通报 且 当前在战斗中
+    -- 2) 或者 Boss 战斗中（自动延迟）
+    -- 如果已经脱战了（计时器延迟触发），直接发送不入队
+    local shouldDelay = inCombat and (db.reportAfterCombat or inBossEncounter)
+
+    if shouldDelay then
         -- 存结构化数据，脱战后合并成一条消息发送
         table.insert(pendingReports, { index = burstIndex, hands = handCount, demons = demons })
     else
