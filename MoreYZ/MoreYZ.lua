@@ -11,6 +11,7 @@ local addonName, ns = ...
 -- =============================================================
 local TYRANT_SPELL_ID     = 265187   -- 召唤恶魔暴君
 local HAND_SPELL_ID       = 105174   -- 古尔丹之手
+local HAND_SPELL_ID_ALT   = 434636   -- 陨灭（古尔丹之手变体）
 local BURST_WINDOW        = 25       -- 爆发窗口（秒）
 local HANDS_PER_DEMON     = 2        -- 每几个古尔丹之手算一个恶魔
 
@@ -288,7 +289,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
 
         if spellID == TYRANT_SPELL_ID then
             StartBurst()
-        elseif spellID == HAND_SPELL_ID then
+        elseif spellID == HAND_SPELL_ID or spellID == HAND_SPELL_ID_ALT then
             RecordHand()
         end
 
